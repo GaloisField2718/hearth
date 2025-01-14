@@ -8,6 +8,7 @@ const logger = createModuleLogger('memoryProcessor');
 const AGENT_ID = chatbotConfig.normalizedBotName;
 const DEBUG_MODE = true;
 const MEMORY_API_URL = process.env.MEMORY_API_URL || 'http://localhost:8000';
+const MEMORY_API_KEY = process.env.MEMORY_API_KEY;
 
 function debugLog(message: string, data?: any) {
   if (DEBUG_MODE) {
@@ -21,7 +22,11 @@ function debugLog(message: string, data?: any) {
  */
 async function pingMemoryServer(): Promise<boolean> {
   try {
-    const res = await fetch(`${MEMORY_API_URL}/ping`);
+    const res = await fetch(`${MEMORY_API_URL}/ping`, {
+      headers: {
+        'X-Password': MEMORY_API_KEY || ''
+      }
+    });
     if (!res.ok) {
       logger.error({ status: res.status, statusText: res.statusText }, 'Ping to memory server failed');
       return false;
@@ -43,51 +48,55 @@ async function pingMemoryServer(): Promise<boolean> {
 /**
  * Stores extracted knowledge in mem0, using run_id as the knowledge category and user_id only for user-specific knowledge.
  */
-export async function storeKnowledgeInMem0(extracted_knowledge: any, client: Client) {
-  const serverUp = await pingMemoryServer();
-  if (!serverUp) {
-    logger.error('Memory server is not reachable; skipping knowledge storage');
-    return;
-  }
+export function storeKnowledgeInMem0(extracted_knowledge: any, client: Client) {
+  // We schedule the logic below to run asynchronously so callers won't block waiting
+  setImmediate(async () => {
+    // comment: This now happens in the background.
+    const serverUp = await pingMemoryServer();
+    if (!serverUp) {
+      logger.error('Memory server is not reachable; skipping knowledge storage');
+      return;
+    }
 
-  // general_knowledge -> run_id = "general_knowledge"
-  if (Array.isArray(extracted_knowledge.general_knowledge) && extracted_knowledge.general_knowledge.length > 0) {
-    const memoryString = formatForMem0(extracted_knowledge.general_knowledge);
-    const result = await addMemoryToMem0({
-      memories: memoryString,
-      run_id: "general_knowledge",
-      agent_id: AGENT_ID
-    });
-    await sendMemoryEmbed("General Knowledge", result, client);
-  }
+    // general_knowledge -> run_id = "general_knowledge"
+    if (Array.isArray(extracted_knowledge.general_knowledge) && extracted_knowledge.general_knowledge.length > 0) {
+      const memoryString = formatForMem0(extracted_knowledge.general_knowledge);
+      const result = await addMemoryToMem0({
+        memories: memoryString,
+        run_id: "general_knowledge",
+        agent_id: AGENT_ID
+      });
+      await sendMemoryEmbed("General Knowledge", result, client);
+    }
 
-  // agent_self -> run_id = "self_knowledge"
-  if (Array.isArray(extracted_knowledge.agent_self) && extracted_knowledge.agent_self.length > 0) {
-    const memoryString = formatForMem0(extracted_knowledge.agent_self);
-    const result = await addMemoryToMem0({
-      memories: memoryString,
-      run_id: "self_knowledge",
-      agent_id: AGENT_ID
-    });
-    await sendMemoryEmbed(`${chatbotConfig.botName} Self-Knowledge`, result, client);
-  }
+    // agent_self -> run_id = "self_knowledge"
+    if (Array.isArray(extracted_knowledge.agent_self) && extracted_knowledge.agent_self.length > 0) {
+      const memoryString = formatForMem0(extracted_knowledge.agent_self);
+      const result = await addMemoryToMem0({
+        memories: memoryString,
+        run_id: "self_knowledge",
+        agent_id: AGENT_ID
+      });
+      await sendMemoryEmbed(`${chatbotConfig.botName} Self-Knowledge`, result, client);
+    }
 
-  // user_specific -> run_id = "user_specific_knowledge", user_id = <Discord user>
-  if (extracted_knowledge.user_specific && Array.isArray(extracted_knowledge.user_specific.users)) {
-    for (const usr of extracted_knowledge.user_specific.users) {
-      const learnings = usr.learnings || [];
-      if (learnings.length > 0) {
-        const memoryString = formatForMem0(learnings);
-        const result = await addMemoryToMem0({
-          memories: memoryString,
-          run_id: "user_specific_knowledge",
-          agent_id: AGENT_ID,
-          user_id: usr.user_id  // At top level with run_id and agent_id
-        });
-        await sendMemoryEmbed(`User Knowledge - ${usr.user_id}`, result, client);
+    // user_specific -> run_id = "user_specific_knowledge", user_id = <Discord user>
+    if (extracted_knowledge.user_specific && Array.isArray(extracted_knowledge.user_specific.users)) {
+      for (const usr of extracted_knowledge.user_specific.users) {
+        const learnings = usr.learnings || [];
+        if (learnings.length > 0) {
+          const memoryString = formatForMem0(learnings);
+          const result = await addMemoryToMem0({
+            memories: memoryString,
+            run_id: "user_specific_knowledge",
+            agent_id: AGENT_ID,
+            user_id: usr.user_id  // At top level with run_id and agent_id
+          });
+          await sendMemoryEmbed(`User Knowledge - ${usr.user_id}`, result, client);
+        }
       }
     }
-  }
+  });
 }
 
 /**
@@ -138,7 +147,8 @@ async function addMemoryToMem0(params: {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "X-Password": MEMORY_API_KEY || ''
       },
       body: JSON.stringify(body)
     });
@@ -365,6 +375,15 @@ export async function queryAllMemories(message: string, userId?: string): Promis
       if (userData.relations.length > 0) {
         sections.push("### Relations:");
         userData.relations.forEach(relGroup => {
+          // Check if relGroup is indeed an array to avoid calling .forEach on non-array
+          if (!Array.isArray(relGroup)) {
+            logger.warn(
+              { relGroup },
+              'RelationGroup is not an array. Skipping to prevent TypeError'
+            );
+            return; // Skip this iteration if it's not in the correct format
+          }
+          // If it's valid, we iterate through each individual relation
           relGroup.forEach(rel => {
             sections.push(`• ${rel.source} ${rel.relationship} ${rel.destination}`);
           });
@@ -426,7 +445,8 @@ async function queryMemoryCategory(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "X-Password": MEMORY_API_KEY || ''
       },
       body: JSON.stringify(body)
     });
